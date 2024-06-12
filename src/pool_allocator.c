@@ -9,6 +9,12 @@
 #define WORD_SIZE sizeof(void *)
 
 /*
+ * Flags
+ */
+#define MEMP_FLAGS_DYNAMIC_ALLOC_OFFSET 0
+#define MEMP_FLAGS_DYNAMIC_ALLOC_MASK (1 << 0)
+
+/*
  * Memory block handle
  * Includes the size as header
  */
@@ -20,7 +26,7 @@ typedef struct memp_block {
   struct memp_block *next;
 } memp_block_t;
 
-typedef struct memp_handle {
+typedef struct memp_pool {
 #ifdef MEMP_STATS
   int32_t free_blocks;
   int32_t used_blocks;
@@ -28,13 +34,15 @@ typedef struct memp_handle {
 #endif
 
   /* Blocks details */
-  uint32_t block_size;
   memp_block_t *pool_p;
-} memp_handle_t;
+  uint32_t block_size;
+  uint32_t flags;
+} memp_pool_t;
 
 /*
- * Stack Linked List helper functions
+ * Stack linked list helper functions
  */
+
 #define node_t memp_block_t
 
 static void push(node_t **base, node_t *node) {
@@ -55,53 +63,65 @@ static node_t *pop(node_t **base) {
 /*
  * Helper functions
  */
-static inline size_t align(size_t size) {
-  return (size + WORD_SIZE - 1) & ~(WORD_SIZE - 1);
-}
 
 static inline int32_t max(int32_t a, int32_t b) { return (a > b) ? a : b; }
 
-/*
- * Memory management functions
+/**
+ * @brief Aligns provided size with word size
  */
-memp_handle_t *memp_init(size_t const block_size, size_t const num_blocks) {
-  if (block_size == 0 || num_blocks == 0) {
-    return NULL;
-  }
+static inline size_t align(const size_t size) {
+  return (size + WORD_SIZE - 1) & ~(WORD_SIZE - 1);
+}
 
-  /*
-   * Allocate memory for memory pool handle and memory pool
-   */
-  size_t const aligned_block_size = align(block_size);
-  size_t const total_block_size =
-      aligned_block_size + sizeof(memp_block_t) - sizeof(memp_block_t *);
-  size_t const pool_size = num_blocks * total_block_size;
-  memp_handle_t *memp_handle =
-      (memp_handle_t *)malloc(sizeof(memp_handle_t) + pool_size);
-  if (!memp_handle) {
-    return NULL;
-  }
+/**
+ * @brief Returns the size of a memory aligned block
+ */
+static inline size_t aligned_block_size(const size_t block_size) {
+  return align(block_size);
+}
 
-  /*
-   * Initialise allocated memory to zero
-   */
-  memset(memp_handle, 0x00, sizeof(memp_handle_t) + pool_size);
+/**
+ * @brief Returns the size of a memory aligned block with its header
+ */
+static inline size_t aligned_block_with_header_size(const size_t block_size) {
+  return aligned_block_size(block_size) + sizeof(memp_block_t) -
+         sizeof(memp_block_t *);
+}
 
-  /*
-   * Initialise stack linked list of memory blocks in allocated memory
-   */
-  size_t block_address = (size_t)memp_handle + sizeof(memp_handle_t);
+/**
+ * @brief Returns the size of a memory pool consisting of the provided number of
+ * blocks, after being aligned and adding their respective headers
+ */
+static inline size_t aligned_pool_size(const size_t block_size,
+                                       const size_t num_blocks) {
+  return num_blocks * aligned_block_with_header_size(block_size);
+}
+
+/**
+ * @brief Initialises the provided buffer as a memory pool, with the first bytes
+ * of the buffer serving as memory pool handle and the remaining bytes serving
+ * as memory pool blocks. This function expects valid arguments and does not
+ * perform any additional validation of these arguments!
+ */
+static memp_handle_t memp_init_buffer(const size_t block_size,
+                                      const size_t num_blocks,
+                                      uint8_t *const buffer) {
+  /* Initialise memory pool handle */
+  memp_pool_t *memp_handle = (memp_pool_t *)buffer;
+
+  /* Initialise stack linked list of memory blocks in remaining buffer */
+  size_t block_address = (size_t)memp_handle + sizeof(memp_pool_t);
   for (uint32_t i = 0; i < num_blocks; i++) {
     memp_block_t *block = (memp_block_t *)block_address;
-    block->size = aligned_block_size;
+    block->size = aligned_block_size(block_size);
     push(&memp_handle->pool_p, block);
 
     /* Update address to next block */
-    block_address += total_block_size;
+    block_address += aligned_block_with_header_size(block_size);
   }
 
   /* Should match the block header entry */
-  memp_handle->block_size = aligned_block_size;
+  memp_handle->block_size = aligned_block_size(block_size);
 #ifdef MEMP_STATS
   memp_handle->free_blocks = num_blocks;
   memp_handle->used_blocks = 0;
@@ -111,7 +131,60 @@ memp_handle_t *memp_init(size_t const block_size, size_t const num_blocks) {
   return memp_handle;
 }
 
-void memp_destroy(memp_handle_t *handle) {
+/*
+ * Memory management functions
+ */
+
+memp_result_t memp_create(const size_t block_size, const size_t num_blocks,
+                          memp_handle_t *const handle) {
+  if (block_size == 0 || num_blocks == 0) {
+    return MEMP_INVALID_ARGS;
+  }
+
+  /* Allocate memory for memory pool handle and memory pool */
+  uint8_t *buffer = (uint8_t *)malloc(
+      sizeof(memp_pool_t) + aligned_pool_size(block_size, num_blocks));
+  if (!buffer)
+    return MEMP_ALLOC_FAILED;
+
+  /* Initialise allocated buffer */
+  memset(buffer, 0x00,
+         sizeof(memp_pool_t) + aligned_pool_size(block_size, num_blocks));
+
+  /* Update handle */
+  *handle = memp_init_buffer(block_size, num_blocks, buffer);
+  (*handle)->flags |= (1 << MEMP_FLAGS_DYNAMIC_ALLOC_OFFSET);
+
+  return MEMP_PASS;
+}
+
+memp_handle_t memp_create_static(const size_t block_size, uint8_t *const buffer,
+                                 const size_t buffer_size) {
+  if (block_size == 0 || !buffer || buffer_size == 0) {
+#ifdef MEMP_DEBUG
+    puts("Invalid arguments passed to 'memp_create_static");
+#endif
+    return NULL;
+  }
+
+  if (buffer_size < aligned_pool_size(block_size, 1) + sizeof(memp_pool_t)) {
+#ifdef MEMP_DEBUG
+    puts("Buffer passed to 'memp_create_static' is not large enough");
+#endif
+    return NULL;
+  }
+
+  /* Initialise buffer */
+  memset(buffer, 0x00, buffer_size);
+
+  /* Calculate number of blocks that fit in the buffer */
+  size_t num_blocks = (buffer_size - sizeof(memp_pool_t)) /
+                      aligned_block_with_header_size(block_size);
+
+  return memp_init_buffer(block_size, num_blocks, buffer);
+}
+
+void memp_destroy(memp_handle_t const handle) {
   if (!handle) {
 #ifdef MEMP_DEBUG
     puts("Invalid handle passed to 'memp_destroy'");
@@ -119,10 +192,16 @@ void memp_destroy(memp_handle_t *handle) {
     return;
   }
 
-  free(handle);
+  if (handle->flags & MEMP_FLAGS_DYNAMIC_ALLOC_MASK) {
+    free(handle);
+  } else {
+#ifdef MEMP_DEBUG
+    puts("Attempted to call `memp_destroy` on statically allocated buffer!");
+#endif /* ifdef MEMP_DEBUG */
+  }
 }
 
-void *memp_malloc(memp_handle_t *handle) {
+void *memp_malloc(memp_handle_t const handle) {
   if (!handle) {
 #ifdef MEMP_DEBUG
     puts("Invalid handle passed to 'memp_malloc'");
@@ -149,7 +228,7 @@ void *memp_malloc(memp_handle_t *handle) {
   return (void *)(&block->next);
 }
 
-void memp_free(memp_handle_t *handle, void *block) {
+void memp_free(memp_handle_t const handle, void *const block) {
   if (!handle || !block) {
 #ifdef MEMP_DEBUG
     puts("Invalid handle passed to 'memp_free'");
@@ -177,9 +256,25 @@ void memp_free(memp_handle_t *handle, void *block) {
   push(&handle->pool_p, block_handle);
 }
 
-int32_t memp_stats_free_blocks(memp_handle_t *handle) {
+int32_t memp_stats_free_blocks(memp_handle_t const handle) {
 #ifdef MEMP_STATS
   return handle->free_blocks;
+#else
+  return -1;
+#endif
+}
+
+int32_t memp_stats_used_blocks(memp_handle_t const handle) {
+#ifdef MEMP_STATS
+  return handle->used_blocks;
+#else
+  return -1;
+#endif
+}
+
+int32_t memp_stats_max_used_blocks(memp_handle_t const handle) {
+#ifdef MEMP_STATS
+  return handle->max_used_blocks;
 #else
   return -1;
 #endif

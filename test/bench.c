@@ -31,8 +31,12 @@ int main(void) {
     /*
      * Memory pool
      */
+    memp_handle_t pool_handle;
+    int result = memp_create(ALLOCATION_SIZE_BYTES, 5, &pool_handle);
+    if (result != MEMP_PASS)
+      return -1;
+
     start_time = (float)clock() / CLOCKS_PER_SEC;
-    memp_handle_t *pool_handle = memp_init(ALLOCATION_SIZE_BYTES, 5);
     for (size_t i = 0; i < BENCHMARK_LENGTH; i++) {
       void *volatile buffer = memp_malloc(pool_handle);
       memp_free(pool_handle, buffer);
